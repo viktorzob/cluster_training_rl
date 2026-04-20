@@ -38,6 +38,7 @@ agent = TD3(
     tensorboard_log = f"runs/mvp2/{RUN_ID}",
     normalize_observations = True,
     normalize_rewards      = True,
+    total_training_steps   = TOTAL_STEPS,
 )
 
 eval_env = DayAheadMarketEnv(demand_center_shift=DEMAND_SHIFT)

@@ -34,6 +34,7 @@ agent = TD3(
     tensorboard_log = f"runs/mvp0/{RUN_ID}",
     normalize_observations = True,
     normalize_rewards      = True,
+    total_training_steps   = TOTAL_STEPS,
 )
 
 summary = train_phase(

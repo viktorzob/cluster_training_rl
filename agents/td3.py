@@ -165,7 +165,7 @@ class TD3:
         obs_dim: int,
         action_dim: int,
         # Architecture
-        hidden_sizes: tuple = (256, 256),
+        hidden_sizes: tuple = (256, 128),
         use_layer_norm_actor: bool  = False,
         use_batch_norm_critic: bool = False,
         # Normalisation
@@ -183,6 +183,8 @@ class TD3:
         target_noise: float  = 0.2,
         target_noise_clip: float = 0.5,
         exploration_noise: float = 0.3,
+        exploration_noise_end: float = 0.05,   # decays linearly to this by end of training
+        total_training_steps: int = 300_000,   # used for noise schedule
         # Logging
         tensorboard_log: str | None = None,
         log_interval: int = 100,
@@ -197,7 +199,9 @@ class TD3:
         self.policy_delay    = policy_delay
         self.target_noise    = target_noise
         self.target_noise_clip = target_noise_clip
-        self.exploration_noise = exploration_noise
+        self.exploration_noise_start = exploration_noise
+        self.exploration_noise_end   = exploration_noise_end
+        self.total_training_steps    = total_training_steps
         self.log_interval      = log_interval
         self.normalize_observations = normalize_observations
         self.normalize_rewards      = normalize_rewards
@@ -245,7 +249,11 @@ class TD3:
             action = self.actor(obs_t).cpu().numpy().squeeze(0)
         self.actor.train()
         if not deterministic:
-            noise  = np.random.normal(0, self.exploration_noise, size=action.shape)
+            frac  = min(self.total_steps / max(self.total_training_steps, 1), 1.0)
+            noise_std = self.exploration_noise_start + frac * (
+                self.exploration_noise_end - self.exploration_noise_start
+            )
+            noise  = np.random.normal(0, noise_std, size=action.shape)
             action = np.clip(action + noise, -1.0, 1.0)
         return action
 
@@ -316,6 +324,11 @@ class TD3:
         if self.writer and metrics:
             for k, v in metrics.items():
                 self.writer.add_scalar(f"train/{k}", v, self.total_steps)
+            frac = min(self.total_steps / max(self.total_training_steps, 1), 1.0)
+            noise_now = self.exploration_noise_start + frac * (
+                self.exploration_noise_end - self.exploration_noise_start
+            )
+            self.writer.add_scalar("train/exploration_noise", noise_now, self.total_steps)
 
     def save(self, path: str):
         torch.save({
