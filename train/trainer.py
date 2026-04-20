@@ -14,7 +14,7 @@ Cumulative trainer:
 import os
 import numpy as np
 from agents.td3 import TD3
-from env.market import DayAheadMarketEnv, OBS_DIM, ACTION_DIM
+from env.market import DayAheadMarketEnv, OBS_DIM, ACTION_DIM, N_CLUSTERS
 
 
 def train_phase(
@@ -102,7 +102,7 @@ def evaluate(
     """
     Deterministic evaluation. Returns per-cluster and overall profit stats.
     """
-    profits   = {0: [], 1: [], 2: []}
+    profits   = {c: [] for c in range(N_CLUSTERS)}
     all_profit = []
 
     for _ in range(n_episodes):
@@ -133,7 +133,7 @@ def _log_eval(agent: TD3, metrics: dict, tag: str):
 
 def _fmt_eval(m: dict) -> str:
     parts = [f"overall={m.get('mean_profit_overall', 0):.1f}"]
-    for c in range(3):
+    for c in range(N_CLUSTERS):
         k = f"mean_profit_c{c}"
         if k in m:
             parts.append(f"c{c}={m[k]:.1f} (n={m.get(f'n_episodes_c{c}', 0)})")
@@ -153,8 +153,9 @@ class CumulativeTrainer:
             {"cluster": 2, "steps": 300_000, "mixing": {0: 0.1, 1: 0.1, 2: 0.8}},
         ]
 
-    The cluster indicator (one-hot) in the observation acts as context,
-    so the policy can route behaviours per cluster without forgetting.
+    After all phases, a final benchmark evaluation runs on a controlled
+    10% rare-event mix — identical conditions to MVP2 — so performance
+    can be compared directly.
     """
 
     def __init__(
@@ -164,12 +165,15 @@ class CumulativeTrainer:
         phases: list[dict],
         checkpoint_dir: str = "checkpoints/cumulative",
         eval_episodes: int  = 200,
+        # Benchmark eval: mirrors MVP2's 10% rare-event mix for direct comparison
+        benchmark_rare_frac: float = 0.10,
     ):
-        self.agent           = agent
-        self.base_env_kwargs = base_env_kwargs
-        self.phases          = phases
-        self.checkpoint_dir  = checkpoint_dir
-        self.eval_episodes   = eval_episodes
+        self.agent               = agent
+        self.base_env_kwargs     = base_env_kwargs
+        self.phases              = phases
+        self.checkpoint_dir      = checkpoint_dir
+        self.eval_episodes       = eval_episodes
+        self.benchmark_rare_frac = benchmark_rare_frac
 
     def run(self) -> list[dict]:
         summaries = []
@@ -177,6 +181,14 @@ class CumulativeTrainer:
             cluster = phase_cfg["cluster"]
             steps   = phase_cfg["steps"]
             mixing  = phase_cfg.get("mixing", None)
+
+            # Log phase boundary as a TensorBoard text marker
+            if self.agent.writer:
+                self.agent.writer.add_text(
+                    "training/phase",
+                    f"Phase {i} start — cluster {cluster}",
+                    self.agent.total_steps,
+                )
 
             # Build training env for this phase
             env_kwargs = dict(self.base_env_kwargs)
@@ -189,7 +201,7 @@ class CumulativeTrainer:
 
             train_env = DayAheadMarketEnv(**env_kwargs)
 
-            # Eval env: full distribution (no forcing)
+            # Eval env: full distribution (no forcing) — tracks all clusters
             eval_kwargs = dict(self.base_env_kwargs)
             eval_kwargs.pop("force_cluster", None)
             eval_kwargs.pop("cluster_mixing_ratio", None)
@@ -206,6 +218,21 @@ class CumulativeTrainer:
                 eval_episodes      = self.eval_episodes,
             )
             summaries.append({"phase": i, "cluster": cluster, **summary})
+
+        # ── Final benchmark: same 10% rare-event mix as MVP2 ─────────────────
+        # This is the key comparison: cumulative-trained vs naive-trained agent
+        # on identical test conditions.
+        print("\n  Running final benchmark eval (10% rare-event mix = MVP2 conditions)...")
+        non_base_clusters = [p["cluster"] for p in self.phases if p["cluster"] != 0]
+        for tc in non_base_clusters:
+            bench_mix = {0: 1.0 - self.benchmark_rare_frac, tc: self.benchmark_rare_frac}
+            bench_kwargs = dict(self.base_env_kwargs)
+            bench_kwargs["cluster_mixing_ratio"] = bench_mix
+            bench_kwargs.pop("force_cluster", None)
+            bench_env = DayAheadMarketEnv(**bench_kwargs)
+            bench_result = evaluate(self.agent, bench_env, self.eval_episodes * 3)
+            _log_eval(self.agent, bench_result, f"benchmark_10pct_vs_cluster{tc}")
+            print(f"  Benchmark (C0 90% + C{tc} 10%): {_fmt_eval(bench_result)}")
 
         print("\n" + "="*60)
         print("  Cumulative training complete.")

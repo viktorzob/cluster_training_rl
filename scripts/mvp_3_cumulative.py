@@ -67,9 +67,10 @@ base_env_kwargs = {
 agent = TD3(
     obs_dim    = OBS_DIM,
     action_dim = ACTION_DIM,
-    tensorboard_log = f"runs/mvp3/{RUN_ID}",
+    tensorboard_log        = f"runs/mvp3/{RUN_ID}",
     normalize_observations = True,
     normalize_rewards      = True,
+    total_training_steps   = len(phases) * STEPS_PER_PHASE,
 )
 
 trainer = CumulativeTrainer(
