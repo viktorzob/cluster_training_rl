@@ -29,7 +29,9 @@ Usage:
 """
 
 import sys, os, argparse
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 import numpy as np
 import torch
@@ -65,7 +67,7 @@ def make_agent(
     return TD3(
         obs_dim         = obs_dim,
         action_dim      = ACTION_DIM,
-        tensorboard_log = f"runs/benchmark/{run_name}",
+        tensorboard_log = f"runs/benchmark/{RUN_ID}/{run_name}",
         normalize_observations = True,
         normalize_rewards      = True,
     )

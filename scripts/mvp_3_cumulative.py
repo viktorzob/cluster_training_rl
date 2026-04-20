@@ -24,7 +24,9 @@ Run:
 """
 
 import sys, os
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 from env.market import DayAheadMarketEnv, OBS_DIM, ACTION_DIM
 from agents.td3 import TD3
@@ -65,7 +67,7 @@ base_env_kwargs = {
 agent = TD3(
     obs_dim    = OBS_DIM,
     action_dim = ACTION_DIM,
-    tensorboard_log = "runs/mvp3",
+    tensorboard_log = f"runs/mvp3/{RUN_ID}",
     normalize_observations = True,
     normalize_rewards      = True,
 )
