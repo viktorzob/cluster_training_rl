@@ -260,8 +260,13 @@ class TD3:
     def store_transition(self, obs, action, reward, next_obs, done):
         obs_norm      = self._normalize_obs(obs,      update=True)
         next_obs_norm = self._normalize_obs(next_obs, update=False)
-        rew_norm      = self._normalize_reward(reward)
-        self.replay_buffer.add(obs_norm, action, rew_norm, next_obs_norm, float(done))
+        # Update reward running stats but store RAW reward.
+        # Normalization is applied at sample time so all sampled rewards
+        # use a consistent current std — avoids mixing large early values
+        # (stored when std≈1) with small later ones (stored when std≈8000).
+        if self.normalize_rewards:
+            self.reward_rms.update(np.array([reward]))
+        self.replay_buffer.add(obs_norm, action, float(reward), next_obs_norm, float(done))
         self.total_steps += 1
 
     def train_step(self) -> dict | None:
@@ -271,6 +276,10 @@ class TD3:
         obs, actions, rewards, next_obs, dones = self.replay_buffer.sample(
             self.batch_size, self.device
         )
+
+        if self.normalize_rewards:
+            std = max(math.sqrt(float(self.reward_rms.var)), 1.0)
+            rewards = rewards / std
 
         with torch.no_grad():
             noise = (torch.randn_like(actions) * self.target_noise).clamp(
@@ -329,6 +338,8 @@ class TD3:
                 self.exploration_noise_end - self.exploration_noise_start
             )
             self.writer.add_scalar("train/exploration_noise", noise_now, self.total_steps)
+            if self.normalize_rewards:
+                self.writer.add_scalar("train/reward_std", self._current_reward_std(), self.total_steps)
 
     def save(self, path: str):
         torch.save({
@@ -374,13 +385,8 @@ class TD3:
             self.obs_rms.update(obs)
         return self.obs_rms.normalize(obs)
 
-    def _normalize_reward(self, reward: float) -> float:
-        if not self.normalize_rewards:
-            return reward
-        self.reward_rms.update(np.array([reward]))
-        # Clamp std from below so near-constant rewards don't blow up the scale.
-        std = max(math.sqrt(float(self.reward_rms.var)), 1.0)
-        return float(reward / std)
+    def _current_reward_std(self) -> float:
+        return max(math.sqrt(float(self.reward_rms.var)), 1.0)
 
     def _soft_update(self, target: nn.Module, source: nn.Module):
         for tp, sp in zip(target.parameters(), source.parameters()):
