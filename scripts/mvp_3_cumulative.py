@@ -1,22 +1,23 @@
 """
 MVP 3 — Cumulative cluster training.
 
-Phase 0: Train on Cluster 0 only          (infra-marginal)
-Phase 1: Train on Cluster 1 only          (headroom, same weights)
-Phase 2: Train on Cluster 2 only          (super-headroom, same weights)
+Phase 0: Train on Cluster 1 only          (headroom: bid HIGH, earn margin)
+Phase 1: Train on Cluster 2 (+ 20% C1)   (super-headroom: bid up to 150)
+Phase 2: Train on Cluster 3 (+ 20% each) (redispatch: bid BELOW MC)
 
-Each phase uses a 10% mixing ratio of the previous cluster(s) to
-guard against catastrophic forgetting.  The one-hot cluster indicator
-in the observation acts as context — the policy routes behaviour
-per cluster without interference.
+Starting from C1 (not C0) ensures the agent has a positive reward signal
+from step 1. C0 (agent always idle) provides no gradient — it is only
+useful as a benchmark comparison, not as a training phase.
 
-Evaluation after each phase uses the FULL distribution so you can
-watch all three cluster profit curves in TensorBoard simultaneously.
+Cluster indicator reference (one-hot in obs):
+  [1,0,0,0] → Cluster 0 (infra-marginal, agent idle — appears only in eval)
+  [0,1,0,0] → Cluster 1 (headroom, agent zone 250-300 MW, bid HIGH ≤ 100)
+  [0,0,1,0] → Cluster 2 (fringe offline, bid HIGH ≤ 150 even on low-demand days)
+  [0,0,0,1] → Cluster 3 (redispatch hours 13-15, bid BELOW MC for 160 €/MWh)
 
-Cluster indicator reference:
-  [1,0,0] → Cluster 0 (infra-marginal, demand < 300)
-  [0,1,0] → Cluster 1 (headroom, demand >= 300, fringe online)
-  [0,0,1] → Cluster 2 (super-headroom, fringe offline)
+Key thesis: C2 looks like C0 from the demand profile alone (fringe offline days
+can have low demand) — the one-hot cluster indicator is what lets the agent
+route to bid-high vs bid-low vs idle, proving that cluster context is necessary.
 
 Run:
     python scripts/mvp_3_cumulative.py
@@ -33,28 +34,27 @@ from agents.td3 import TD3
 from train.trainer import CumulativeTrainer
 
 # ── Demand configuration ─────────────────────────────────────────────────────
-# Slight negative shift so Cluster 1/2 events occur ~20-30% of the time
-# in the full evaluation env — enough to evaluate both clusters but
-# still a meaningful imbalance.
-BASE_DEMAND_SHIFT = -40.0   # center=260 MW → agent zone reachable but not dominant
+# Eval env uses a moderate shift so all 4 clusters appear during evaluation.
+# Training phases use force_cluster / mixing, so this mainly controls eval rarity.
+BASE_DEMAND_SHIFT = -20.0   # center=280 MW → agent zone frequent, all clusters reachable
 
 STEPS_PER_PHASE = 300_000
 
 phases = [
     {
-        "cluster": 0,
-        "steps":   STEPS_PER_PHASE,
-        "mixing":  None,                        # pure Cluster 0
-    },
-    {
         "cluster": 1,
         "steps":   STEPS_PER_PHASE,
-        "mixing":  {0: 0.1, 1: 0.9},           # 90% Cluster 1, 10% Cluster 0
+        "mixing":  None,                        # pure C1: dense headroom signal
     },
     {
         "cluster": 2,
         "steps":   STEPS_PER_PHASE,
-        "mixing":  {0: 0.1, 1: 0.1, 2: 0.8},  # 80% Cluster 2, 10% each previous
+        "mixing":  {1: 0.2, 2: 0.8},           # 80% C2, 20% C1 (anti-forgetting)
+    },
+    {
+        "cluster": 3,
+        "steps":   STEPS_PER_PHASE,
+        "mixing":  {1: 0.2, 2: 0.2, 3: 0.6},  # 60% C3, 20% each previous
     },
 ]
 
@@ -87,6 +87,7 @@ print("\n=== CUMULATIVE TRAINING COMPLETE ===")
 print("Compare mvp2 (naive rare) vs mvp3 (clustered) TensorBoard logs:")
 print("  tensorboard --logdir runs/")
 print("\nExpected in mvp3:")
-print("  After Phase 0: cluster0 profit ≈ 0, cluster1/2 ≈ 0")
-print("  After Phase 1: cluster0 ≈ 0, cluster1 profit > 0 (agent exploits headroom)")
-print("  After Phase 2: all clusters show positive profit where opportunity exists")
+print("  Phase 0 end: C1 profit HIGH, C2/C3 not yet learned")
+print("  Phase 1 end: C1 maintained, C2 profit HIGH (bid up to 150)")
+print("  Phase 2 end: C3 profit HIGH (redispatch), C1/C2 maintained")
+print("  vs mvp2: all cluster profits LOW despite cluster indicator in obs")
