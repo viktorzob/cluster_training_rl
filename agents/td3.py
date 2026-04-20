@@ -311,6 +311,11 @@ class TD3:
         metrics = {"critic_loss": critic_loss.item()}
         if actor_loss_val is not None:
             metrics["actor_loss"] = actor_loss_val
+            # Un-normalised Q so you can see actual € policy value in TensorBoard
+            if self.normalize_rewards:
+                metrics["q_value_euros"] = -actor_loss_val * self._current_reward_std()
+            else:
+                metrics["q_value_euros"] = -actor_loss_val
         return metrics
 
     def log_episode(self, reward: float, info: dict):
