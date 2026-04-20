@@ -1,0 +1,272 @@
+"""
+Day-ahead electricity market environment.
+
+One episode = one trading day.
+Single step: agent submits 24 price bids simultaneously,
+market clears all hours, episode ends.
+
+Observation  : [demand_24h_normalised (24,), cluster_onehot (3,)] = shape (27,)
+Action       : 24 price bids, raw tanh output scaled so 0 → agent MC
+Reward       : total daily profit = sum_h max(0, (clearing_price_h - MC) * dispatch_h)
+
+Clusters (one-hot [c0, c1, c2]):
+  [1,0,0] Cluster 0 — infra-marginal  : demand < FRINGE_THRESHOLD all day
+  [0,1,0] Cluster 1 — headroom        : some hours demand >= FRINGE_THRESHOLD
+  [0,0,1] Cluster 2 — super-headroom  : fringe offline for up to FRINGE_RECOVERY_HOURS
+                                         (can occur even when demand > threshold)
+"""
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+from env.demand import generate_demand_profile, DEMAND_CENTER, _simulate_shutdown
+
+# ── Market constants ─────────────────────────────────────────────────────────
+FRINGE_THRESHOLD     = 300.0   # MW — demand level that enables headroom bidding
+FRINGE_SHUTDOWN_HOURS = 4      # consecutive below-threshold hours to trigger shutdown
+FRINGE_RECOVERY_HOURS = 4      # hours fringe stays offline after shutdown
+
+AGENT_CAPACITY   = 50.0        # MW
+AGENT_MC         = 50.0        # €/MWh  (marginal cost, action=0 maps here)
+
+# Fringe price when online and demand >= threshold: base + demand-proportional component
+FRINGE_PRICE_BASE      = 100.0   # €/MWh
+FRINGE_PRICE_DEMAND_K  = 0.10    # €/MWh per MW above threshold  (small dynamic component)
+
+# Price caps per regime
+HEADROOM_PRICE_CAP       = 100.0   # Cluster 1: agent can set up to here
+SUPER_HEADROOM_PRICE_CAP = 150.0   # Cluster 2: fringe offline, agent sets up to here
+
+PRICE_FLOOR = AGENT_MC   # agent bids at least MC (action clipped)
+
+N_CLUSTERS = 3
+OBS_DIM    = 24 + N_CLUSTERS   # 24h demand + one-hot
+ACTION_DIM = 24                # one price bid per hour
+
+
+class DayAheadMarketEnv(gym.Env):
+    """
+    Parameters
+    ----------
+    demand_center_shift : float
+        Shifts demand profile up/down, controlling rarity of Cluster 1/2.
+        0.0  → ~50% hours above threshold (balanced).
+        -30  → headroom events rare.
+        +30  → headroom events frequent.
+    force_cluster : int | None
+        If set (0/1/2), only episodes of that cluster are generated.
+        Used during per-cluster training phases.
+    cluster_mixing_ratio : dict | None
+        e.g. {0: 0.2, 1: 0.8} — sample cluster proportionally.
+        Overrides force_cluster if provided.
+    noise_std_fraction : float
+        Per-hour demand noise as fraction of local demand.
+    seed : int | None
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        demand_center_shift: float = 0.0,
+        force_cluster: int | None = None,
+        cluster_mixing_ratio: dict | None = None,
+        noise_std_fraction: float = 0.05,
+        seed: int | None = None,
+    ):
+        super().__init__()
+        self.demand_center_shift = demand_center_shift
+        self.force_cluster       = force_cluster
+        self.cluster_mixing_ratio = cluster_mixing_ratio
+        self.noise_std_fraction  = noise_std_fraction
+
+        self._rng = np.random.default_rng(seed)
+
+        # Action space: raw values in [-1, 1] (tanh output), scaled to prices in trainer
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32
+        )
+
+        # Observation space: demand (normalised ≈ [0,2]) + one-hot cluster [0,1]
+        obs_low  = np.zeros(OBS_DIM, dtype=np.float32)
+        obs_high = np.concatenate([
+            np.full(24, 4.0, dtype=np.float32),   # demand up to 4× centre
+            np.ones(N_CLUSTERS, dtype=np.float32),
+        ])
+        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+
+        # Populated each reset
+        self._demand: np.ndarray | None = None
+        self._cluster: int | None       = None
+        self._shutdown: np.ndarray | None = None
+
+        # Tracking for info dict
+        self.episode_count = 0
+
+    # ── Gym interface ────────────────────────────────────────────────────────
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+
+        demand, cluster, shutdown = self._sample_episode()
+        self._demand   = demand
+        self._cluster  = cluster
+        self._shutdown = shutdown
+        self.episode_count += 1
+
+        obs = self._make_obs(demand, cluster)
+        return obs, {}
+
+    def step(self, action: np.ndarray):
+        assert self._demand is not None, "Call reset() before step()."
+
+        # Scale action: tanh=0 → MC, tanh=+1 → SUPER_HEADROOM_PRICE_CAP
+        prices = self._scale_action(action)
+
+        reward, info = self._clear_market(prices, self._demand, self._shutdown, self._cluster)
+
+        obs = self._make_obs(self._demand, self._cluster)   # same obs (single-step episode)
+        terminated = True
+        truncated  = False
+        return obs, float(reward), terminated, truncated, info
+
+    def render(self):
+        pass
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _sample_episode(self) -> tuple[np.ndarray, int, np.ndarray]:
+        """Generate demand, determine cluster, compute fringe shutdown mask."""
+        max_tries = 200
+        for _ in range(max_tries):
+            demand   = generate_demand_profile(
+                self.demand_center_shift, self.noise_std_fraction, self._rng
+            )
+            shutdown = _simulate_shutdown(demand)
+            cluster  = _classify_cluster(demand, shutdown)
+
+            target = self._target_cluster()
+            if target is None or cluster == target:
+                return demand, cluster, shutdown
+
+        # Fallback: force-generate a profile matching the target cluster
+        return self._force_generate_cluster(target)
+
+    def _target_cluster(self) -> int | None:
+        if self.cluster_mixing_ratio is not None:
+            clusters = list(self.cluster_mixing_ratio.keys())
+            probs    = np.array([self.cluster_mixing_ratio[c] for c in clusters])
+            probs    = probs / probs.sum()
+            return int(self._rng.choice(clusters, p=probs))
+        return self.force_cluster   # None means any cluster
+
+    def _force_generate_cluster(self, cluster: int) -> tuple[np.ndarray, int, np.ndarray]:
+        """Brute-force generate a profile that matches the requested cluster."""
+        shift_map = {0: -60.0, 1: 20.0, 2: -40.0}
+        shift = self.demand_center_shift + shift_map.get(cluster, 0.0)
+        for _ in range(2000):
+            demand   = generate_demand_profile(shift, self.noise_std_fraction, self._rng)
+            shutdown = _simulate_shutdown(demand)
+            if _classify_cluster(demand, shutdown) == cluster:
+                return demand, cluster, shutdown
+        # Last resort: return whatever we have
+        return demand, _classify_cluster(demand, shutdown), shutdown
+
+    @staticmethod
+    def _make_obs(demand: np.ndarray, cluster: int) -> np.ndarray:
+        demand_norm = (demand / DEMAND_CENTER).astype(np.float32)
+        one_hot     = np.zeros(N_CLUSTERS, dtype=np.float32)
+        one_hot[cluster] = 1.0
+        return np.concatenate([demand_norm, one_hot])
+
+    @staticmethod
+    def _scale_action(action: np.ndarray) -> np.ndarray:
+        """
+        Map tanh output [-1, 1] → price bids.
+        tanh = 0  → AGENT_MC  (break-even)
+        tanh = +1 → SUPER_HEADROOM_PRICE_CAP
+        tanh = -1 → 0  (effectively giving away power; will not dispatch)
+        Linear mapping: price = MC + (tanh+1)/2 * (CAP - MC)
+        """
+        a = np.clip(action, -1.0, 1.0)
+        price = AGENT_MC + (a + 1.0) / 2.0 * (SUPER_HEADROOM_PRICE_CAP - AGENT_MC)
+        return price.astype(np.float64)
+
+    @staticmethod
+    def _clear_market(
+        agent_prices: np.ndarray,
+        demand: np.ndarray,
+        shutdown: np.ndarray,
+        cluster: int,
+    ) -> tuple[float, dict]:
+        """
+        Pay-as-cleared market clearing for 24 hours.
+
+        Fringe merit order:
+          - Cluster 0  (infra-marginal): fringe clears at AGENT_MC (agent is marginal/sub-marginal)
+          - Cluster 1  (headroom)      : fringe clears at FRINGE_PRICE_BASE + demand-component
+          - Cluster 2  (super-headroom): fringe offline → agent is price setter up to CAP
+        """
+        profits      = np.zeros(24)
+        clearing_prices = np.zeros(24)
+        dispatches   = np.zeros(24)
+
+        for h in range(24):
+            d  = demand[h]
+            ap = agent_prices[h]
+
+            if shutdown[h]:
+                # Cluster 2: fringe offline, agent can set price up to SUPER_HEADROOM_PRICE_CAP
+                fringe_price = SUPER_HEADROOM_PRICE_CAP
+            elif d >= FRINGE_THRESHOLD:
+                # Cluster 1: demand-dependent fringe price
+                excess = d - FRINGE_THRESHOLD
+                fringe_price = FRINGE_PRICE_BASE + FRINGE_PRICE_DEMAND_K * excess
+                fringe_price = min(fringe_price, SUPER_HEADROOM_PRICE_CAP - 1.0)
+            else:
+                # Cluster 0: fringe sets price at agent MC (agent infra-marginal or at MC)
+                fringe_price = AGENT_MC
+
+            # Agent dispatched if its bid <= clearing price
+            # Clearing price = min(agent_bid, fringe_price) if agent dispatched, else fringe
+            if ap <= fringe_price:
+                clearing = ap          # agent is price setter (or tied)
+                dispatch = AGENT_CAPACITY
+            else:
+                clearing = fringe_price
+                dispatch = 0.0        # agent too expensive, not dispatched
+
+            profit = max(0.0, (clearing - AGENT_MC) * dispatch)
+            profits[h]         = profit
+            clearing_prices[h] = clearing
+            dispatches[h]      = dispatch
+
+        total_profit = profits.sum()
+        info = {
+            "cluster":          cluster,
+            "total_profit":     total_profit,
+            "clearing_prices":  clearing_prices,
+            "agent_prices":     agent_prices,
+            "dispatches":       dispatches,
+            "demand":           demand,
+            "shutdown_mask":    shutdown,
+            "hours_dispatched": int(dispatches.sum() / AGENT_CAPACITY),
+            "hours_above_threshold": int((demand >= FRINGE_THRESHOLD).sum()),
+            "hours_shutdown":   int(shutdown.sum()),
+        }
+        return total_profit, info
+
+
+def _classify_cluster(demand: np.ndarray, shutdown: np.ndarray) -> int:
+    """
+    Cluster 2 takes priority if ANY hour has fringe offline.
+    Cluster 1 if any hour has demand >= threshold (and fringe online).
+    Cluster 0 otherwise.
+    """
+    if shutdown.any():
+        return 2
+    if (demand >= FRINGE_THRESHOLD).any():
+        return 1
+    return 0
