@@ -42,7 +42,13 @@ def train_phase(
     print(f"{'='*60}")
 
     while steps < total_steps:
-        action = agent.predict(obs, deterministic=False)
+        # Random warm-up (matches SB3 behaviour): sample uniformly from action
+        # space before learning starts so the replay buffer contains diverse
+        # price bids, not just near-MC actions from the untrained actor.
+        if agent.total_steps < agent.learning_starts:
+            action = env.action_space.sample()
+        else:
+            action = agent.predict(obs, deterministic=False)
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 

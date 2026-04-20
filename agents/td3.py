@@ -178,11 +178,11 @@ class TD3:
         critic_lr: float     = 3e-4,
         batch_size: int      = 256,
         buffer_size: int     = 1_000_000,
-        learning_starts: int = 1_000,
+        learning_starts: int = 5_000,
         policy_delay: int    = 2,
         target_noise: float  = 0.2,
         target_noise_clip: float = 0.5,
-        exploration_noise: float = 0.1,
+        exploration_noise: float = 0.3,
         # Logging
         tensorboard_log: str | None = None,
         log_interval: int = 100,
@@ -365,7 +365,9 @@ class TD3:
         if not self.normalize_rewards:
             return reward
         self.reward_rms.update(np.array([reward]))
-        return float(reward / (math.sqrt(float(self.reward_rms.var)) + 1e-8))
+        # Clamp std from below so near-constant rewards don't blow up the scale.
+        std = max(math.sqrt(float(self.reward_rms.var)), 1.0)
+        return float(reward / std)
 
     def _soft_update(self, target: nn.Module, source: nn.Module):
         for tp, sp in zip(target.parameters(), source.parameters()):
