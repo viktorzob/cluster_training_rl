@@ -10,10 +10,12 @@ Action       : 24 price bids, raw tanh output scaled so 0 → agent MC
 Reward       : total daily profit = sum_h max(0, (clearing_price_h - MC) * dispatch_h)
 
 Clusters (one-hot [c0, c1, c2]):
-  [1,0,0] Cluster 0 — infra-marginal  : demand < FRINGE_THRESHOLD all day
-  [0,1,0] Cluster 1 — headroom        : some hours demand >= FRINGE_THRESHOLD
-  [0,0,1] Cluster 2 — super-headroom  : fringe offline for up to FRINGE_RECOVERY_HOURS
-                                         (can occur even when demand > threshold)
+  [1,0,0] Cluster 0 — no headroom     : demand never enters agent zone (≤ BASELOAD or > FRINGE_THRESHOLD)
+                                         Agent either idle or infra-marginal at fringe price, earns 0 discovery profit
+  [0,1,0] Cluster 1 — headroom        : some hours BASELOAD < demand <= FRINGE_THRESHOLD
+                                         Agent is marginal, can set price up to 100 €/MWh
+  [0,0,1] Cluster 2 — super-headroom  : fringe offline for FRINGE_RECOVERY_HOURS
+                                         Agent marginal at any demand level, can set price up to 150 €/MWh
 """
 
 import numpy as np
@@ -23,20 +25,26 @@ from gymnasium import spaces
 from env.demand import generate_demand_profile, DEMAND_CENTER, _simulate_shutdown
 
 # ── Market constants ─────────────────────────────────────────────────────────
-FRINGE_THRESHOLD     = 300.0   # MW — demand level that enables headroom bidding
+BASELOAD_CAPACITY    = 250.0   # MW — always-on cheap generation (below agent MC)
+FRINGE_THRESHOLD     = 300.0   # MW — above this, expensive fringe is needed and sets price
 FRINGE_SHUTDOWN_HOURS = 4      # consecutive below-threshold hours to trigger shutdown
 FRINGE_RECOVERY_HOURS = 4      # hours fringe stays offline after shutdown
 
-AGENT_CAPACITY   = 50.0        # MW
+AGENT_CAPACITY   = 50.0        # MW  (covers residual demand between baseload and fringe)
 AGENT_MC         = 50.0        # €/MWh  (marginal cost, action=0 maps here)
 
-# Fringe price when online and demand >= threshold: base + demand-proportional component
+# Merit order:
+#   [0, BASELOAD_CAPACITY]     → baseload, always dispatched, price below AGENT_MC
+#   [BASELOAD_CAPACITY, FRINGE_THRESHOLD] → agent zone: agent is marginal, sets own price
+#   [FRINGE_THRESHOLD, ∞]      → expensive fringe at FRINGE_PRICE_BASE, sets clearing price
+
+# Fringe price when online and demand >= FRINGE_THRESHOLD
 FRINGE_PRICE_BASE      = 100.0   # €/MWh
-FRINGE_PRICE_DEMAND_K  = 0.10    # €/MWh per MW above threshold  (small dynamic component)
+FRINGE_PRICE_DEMAND_K  = 0.10    # €/MWh per MW above threshold (small dynamic component)
 
 # Price caps per regime
-HEADROOM_PRICE_CAP       = 100.0   # Cluster 1: agent can set up to here
-SUPER_HEADROOM_PRICE_CAP = 150.0   # Cluster 2: fringe offline, agent sets up to here
+HEADROOM_PRICE_CAP       = 100.0   # max agent can earn as marginal (Cluster 1)
+SUPER_HEADROOM_PRICE_CAP = 150.0   # fringe offline, agent price setter (Cluster 2)
 
 PRICE_FLOOR = AGENT_MC   # agent bids at least MC (action clipped)
 
@@ -163,8 +171,13 @@ class DayAheadMarketEnv(gym.Env):
         return self.force_cluster   # None means any cluster
 
     def _force_generate_cluster(self, cluster: int) -> tuple[np.ndarray, int, np.ndarray]:
-        """Brute-force generate a profile that matches the requested cluster."""
-        shift_map = {0: -60.0, 1: 20.0, 2: -40.0}
+        """Brute-force generate a profile that matches the requested cluster.
+
+        Cluster 0 needs demand well below BASELOAD_CAPACITY so the dual-peak
+        profile never enters the 250-300 agent zone (shift=-100 → center=200 MW,
+        peak≈240 MW < 250 MW).
+        """
+        shift_map = {0: -100.0, 1: 0.0, 2: -30.0}
         shift = self.demand_center_shift + shift_map.get(cluster, 0.0)
         for _ in range(2000):
             demand   = generate_demand_profile(shift, self.noise_std_fraction, self._rng)
@@ -204,39 +217,73 @@ class DayAheadMarketEnv(gym.Env):
         """
         Pay-as-cleared market clearing for 24 hours.
 
-        Fringe merit order:
-          - Cluster 0  (infra-marginal): fringe clears at AGENT_MC (agent is marginal/sub-marginal)
-          - Cluster 1  (headroom)      : fringe clears at FRINGE_PRICE_BASE + demand-component
-          - Cluster 2  (super-headroom): fringe offline → agent is price setter up to CAP
+        Merit order per hour:
+          1. Baseload (BASELOAD_CAPACITY MW) — always dispatched, price below agent MC.
+          2. Agent (up to AGENT_CAPACITY MW) — covers residual demand above baseload.
+          3. Expensive fringe — unlimited capacity at FRINGE_PRICE_BASE (or 150 if offline-recovery).
+
+        Three regimes per hour:
+          demand <= BASELOAD_CAPACITY:
+              Agent not needed. Dispatch = 0. No profit.
+          BASELOAD_CAPACITY < demand <= FRINGE_THRESHOLD  (agent is marginal):
+              residual = demand - BASELOAD_CAPACITY  (< AGENT_CAPACITY)
+              Agent sets the clearing price (price discovery zone).
+              If ap <= fringe_price: dispatch = residual, clearing = ap  (agent is price setter)
+              Else:                  dispatch = 0,        clearing = fringe_price (fringe steps in)
+          demand > FRINGE_THRESHOLD  (fringe is marginal):
+              Agent fully infra-marginal (dispatch = AGENT_CAPACITY).
+              Fringe sets clearing price. Agent earns (fringe_price - MC) * AGENT_CAPACITY.
+
+          Cluster 2 override: fringe offline → fringe_price = SUPER_HEADROOM_PRICE_CAP.
+              Agent is always marginal regardless of demand level.
+              dispatch = min(AGENT_CAPACITY, max(0, demand - BASELOAD_CAPACITY))
         """
-        profits      = np.zeros(24)
+        profits         = np.zeros(24)
         clearing_prices = np.zeros(24)
-        dispatches   = np.zeros(24)
+        dispatches      = np.zeros(24)
 
         for h in range(24):
             d  = demand[h]
             ap = agent_prices[h]
 
-            if shutdown[h]:
-                # Cluster 2: fringe offline, agent can set price up to SUPER_HEADROOM_PRICE_CAP
-                fringe_price = SUPER_HEADROOM_PRICE_CAP
-            elif d >= FRINGE_THRESHOLD:
-                # Cluster 1: demand-dependent fringe price
-                excess = d - FRINGE_THRESHOLD
-                fringe_price = FRINGE_PRICE_BASE + FRINGE_PRICE_DEMAND_K * excess
-                fringe_price = min(fringe_price, SUPER_HEADROOM_PRICE_CAP - 1.0)
-            else:
-                # Cluster 0: fringe sets price at agent MC (agent infra-marginal or at MC)
-                fringe_price = AGENT_MC
+            residual = max(0.0, d - BASELOAD_CAPACITY)
 
-            # Agent dispatched if its bid <= clearing price
-            # Clearing price = min(agent_bid, fringe_price) if agent dispatched, else fringe
-            if ap <= fringe_price:
-                clearing = ap          # agent is price setter (or tied)
-                dispatch = AGENT_CAPACITY
+            if shutdown[h]:
+                # Fringe offline: agent is always marginal, bids freely up to SUPER_HEADROOM_PRICE_CAP
+                fringe_price  = SUPER_HEADROOM_PRICE_CAP
+                agent_needed  = min(AGENT_CAPACITY, residual)
+                if ap <= fringe_price and agent_needed > 0:
+                    clearing = ap
+                    dispatch = agent_needed
+                else:
+                    clearing = fringe_price
+                    dispatch = 0.0
+
+            elif d > FRINGE_THRESHOLD:
+                # Fringe online and needed: fringe sets clearing, agent infra-marginal
+                excess        = d - FRINGE_THRESHOLD
+                fringe_price  = FRINGE_PRICE_BASE + FRINGE_PRICE_DEMAND_K * excess
+                fringe_price  = min(fringe_price, SUPER_HEADROOM_PRICE_CAP - 1.0)
+                clearing      = fringe_price
+                dispatch      = AGENT_CAPACITY   # agent always cheaper, fully dispatched
+
+            elif residual > 0:
+                # Agent zone: BASELOAD_CAPACITY < demand <= FRINGE_THRESHOLD
+                # Agent is marginal for 'residual' MW; can set price up to fringe cap
+                fringe_price = HEADROOM_PRICE_CAP
+                agent_needed = min(AGENT_CAPACITY, residual)
+                if ap <= fringe_price:
+                    clearing = ap            # agent discovers and sets the price
+                    dispatch = agent_needed  # partial dispatch if residual < capacity
+                else:
+                    # Agent bid above fringe: fringe steps in, agent not dispatched
+                    clearing = fringe_price
+                    dispatch = 0.0
+
             else:
-                clearing = fringe_price
-                dispatch = 0.0        # agent too expensive, not dispatched
+                # demand <= BASELOAD_CAPACITY: baseload covers everything, agent idle
+                clearing = 0.0
+                dispatch = 0.0
 
             profit = max(0.0, (clearing - AGENT_MC) * dispatch)
             profits[h]         = profit
@@ -262,11 +309,12 @@ class DayAheadMarketEnv(gym.Env):
 def _classify_cluster(demand: np.ndarray, shutdown: np.ndarray) -> int:
     """
     Cluster 2 takes priority if ANY hour has fringe offline.
-    Cluster 1 if any hour has demand >= threshold (and fringe online).
-    Cluster 0 otherwise.
+    Cluster 1 if any hour has demand in agent zone (BASELOAD < demand <= FRINGE_THRESHOLD).
+    Cluster 0 otherwise (agent always idle or always infra-marginal at fringe price).
     """
     if shutdown.any():
         return 2
-    if (demand >= FRINGE_THRESHOLD).any():
+    in_agent_zone = (demand > BASELOAD_CAPACITY) & (demand <= FRINGE_THRESHOLD)
+    if in_agent_zone.any():
         return 1
     return 0

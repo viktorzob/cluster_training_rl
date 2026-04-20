@@ -22,8 +22,8 @@ from agents.td3 import TD3
 from train.trainer import train_phase
 
 TOTAL_STEPS  = 500_000
-# demand_center_shift = -20 → ~10-15% of hours above 300
-DEMAND_SHIFT = -20.0
+# demand_center_shift = -60 → ~10% of hours in 250-300 agent zone (rare headroom)
+DEMAND_SHIFT = -60.0
 
 env = DayAheadMarketEnv(
     demand_center_shift = DEMAND_SHIFT,

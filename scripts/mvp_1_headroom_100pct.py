@@ -18,7 +18,7 @@ from agents.td3 import TD3
 from train.trainer import train_phase
 
 TOTAL_STEPS  = 300_000
-DEMAND_SHIFT = +40.0   # shifts demand to ~340 MW mean → reliably above 300
+DEMAND_SHIFT = -20.0   # center=280 MW → most hours in 250-300 agent zone → frequent headroom
 
 env = DayAheadMarketEnv(
     demand_center_shift = DEMAND_SHIFT,

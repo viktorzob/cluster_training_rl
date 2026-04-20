@@ -34,7 +34,7 @@ from train.trainer import CumulativeTrainer
 # Slight negative shift so Cluster 1/2 events occur ~20-30% of the time
 # in the full evaluation env — enough to evaluate both clusters but
 # still a meaningful imbalance.
-BASE_DEMAND_SHIFT = -15.0
+BASE_DEMAND_SHIFT = -40.0   # center=260 MW → agent zone reachable but not dominant
 
 STEPS_PER_PHASE = 300_000
 

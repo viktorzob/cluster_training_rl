@@ -18,7 +18,7 @@ from agents.td3 import TD3
 from train.trainer import train_phase, evaluate
 
 TOTAL_STEPS      = 300_000
-DEMAND_SHIFT     = -60.0   # pushes demand to ~240 MW mean → always below 300
+DEMAND_SHIFT     = -100.0  # pushes demand center to ~200 MW → always below 250 (baseload only)
 
 env = DayAheadMarketEnv(
     demand_center_shift = DEMAND_SHIFT,
