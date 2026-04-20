@@ -9,13 +9,13 @@ Observation  : [demand_24h_normalised (24,), cluster_onehot (3,)] = shape (27,)
 Action       : 24 price bids, raw tanh output scaled so 0 → agent MC
 Reward       : total daily profit = sum_h max(0, (clearing_price_h - MC) * dispatch_h)
 
-Clusters (one-hot [c0, c1, c2]):
-  [1,0,0] Cluster 0 — no headroom     : demand never enters agent zone (≤ BASELOAD or > FRINGE_THRESHOLD)
-                                         Agent either idle or infra-marginal at fringe price, earns 0 discovery profit
-  [0,1,0] Cluster 1 — headroom        : some hours BASELOAD < demand <= FRINGE_THRESHOLD
-                                         Agent is marginal, can set price up to 100 €/MWh
-  [0,0,1] Cluster 2 — super-headroom  : fringe offline for FRINGE_RECOVERY_HOURS
-                                         Agent marginal at any demand level, can set price up to 150 €/MWh
+Clusters (one-hot [c0, c1, c2, c3]):
+  [1,0,0,0] Cluster 0 — no headroom    : demand never in agent zone; agent idle or infra-marginal
+  [0,1,0,0] Cluster 1 — headroom       : some hours 250 < demand ≤ 300; agent marginal, bid HIGH (up to 100)
+  [0,0,1,0] Cluster 2 — super-headroom : fringe offline; agent marginal up to 150 regardless of demand
+  [0,0,0,1] Cluster 3 — redispatch     : hours 11-13 in agent zone; bid BELOW MC to earn 160 €/MWh
+
+Priority: Cluster 2 > Cluster 3 > Cluster 1 > Cluster 0
 """
 
 import numpy as np
@@ -46,10 +46,17 @@ FRINGE_PRICE_DEMAND_K  = 0.10    # €/MWh per MW above threshold (small dynamic
 HEADROOM_PRICE_CAP       = 100.0   # max agent can earn as marginal (Cluster 1)
 SUPER_HEADROOM_PRICE_CAP = 150.0   # fringe offline, agent price setter (Cluster 2)
 
+# Cluster 3 — redispatch arbitrage
+# If agent bids BELOW MC in REDISPATCH_HOURS during an agent-zone hour,
+# it receives a redispatch payment (simulates grid operator paying for downward flexibility).
+# Optimal action is the OPPOSITE of Cluster 1: bid low, not high.
+REDISPATCH_HOURS   = [13, 14, 15]   # post-lunch dip: demand reliably in 250-300 MW zone
+REDISPATCH_PRICE   = 160.0          # €/MWh paid for full capacity when agent bids below MC
+
 PRICE_FLOOR = AGENT_MC   # agent bids at least MC (action clipped)
 
-N_CLUSTERS = 3
-OBS_DIM    = 24 + N_CLUSTERS   # 24h demand + one-hot
+N_CLUSTERS = 4
+OBS_DIM    = 24 + N_CLUSTERS   # 24h demand + one-hot (now 28)
 ACTION_DIM = 24                # one price bid per hour
 
 
@@ -177,7 +184,8 @@ class DayAheadMarketEnv(gym.Env):
         profile never enters the 250-300 agent zone (shift=-100 → center=200 MW,
         peak≈240 MW < 250 MW).
         """
-        shift_map = {0: -100.0, 1: 0.0, 2: -30.0}
+        # Cluster 3 needs center≈280 so hours 13-15 land in 250-300 agent zone
+        shift_map = {0: -100.0, 1: 0.0, 2: -30.0, 3: -20.0}
         shift = self.demand_center_shift + shift_map.get(cluster, 0.0)
         for _ in range(2000):
             demand   = generate_demand_profile(shift, self.noise_std_fraction, self._rng)
@@ -197,15 +205,15 @@ class DayAheadMarketEnv(gym.Env):
     @staticmethod
     def _scale_action(action: np.ndarray) -> np.ndarray:
         """
-        Map tanh output [-1, 1] → price bids.
-        tanh = 0  → AGENT_MC  (break-even)
-        tanh = +1 → SUPER_HEADROOM_PRICE_CAP
-        tanh = -1 → 0  (effectively giving away power; will not dispatch)
-        Linear mapping: price = MC + (tanh+1)/2 * (CAP - MC)
+        Map tanh output [-1, 1] → price bids centred at MC.
+          tanh =  0  → AGENT_MC       (break-even, no profit)
+          tanh = +1  → SUPER_HEADROOM_PRICE_CAP  (max headroom bid)
+          tanh = -1  → AGENT_MC - (CAP - MC) ≈ 0  (below MC, triggers redispatch)
+        Linear mapping: price = MC + a * (CAP - MC), clipped to [0, CAP].
         """
         a = np.clip(action, -1.0, 1.0)
-        price = AGENT_MC + (a + 1.0) / 2.0 * (SUPER_HEADROOM_PRICE_CAP - AGENT_MC)
-        return price.astype(np.float64)
+        price = AGENT_MC + a * (SUPER_HEADROOM_PRICE_CAP - AGENT_MC)
+        return np.clip(price, 0.0, SUPER_HEADROOM_PRICE_CAP).astype(np.float64)
 
     @staticmethod
     def _clear_market(
@@ -269,14 +277,19 @@ class DayAheadMarketEnv(gym.Env):
 
             elif residual > 0:
                 # Agent zone: BASELOAD_CAPACITY < demand <= FRINGE_THRESHOLD
-                # Agent is marginal for 'residual' MW; can set price up to fringe cap
                 fringe_price = HEADROOM_PRICE_CAP
                 agent_needed = min(AGENT_CAPACITY, residual)
-                if ap <= fringe_price:
-                    clearing = ap            # agent discovers and sets the price
-                    dispatch = agent_needed  # partial dispatch if residual < capacity
+
+                if h in REDISPATCH_HOURS and cluster == 3 and ap < AGENT_MC:
+                    # Cluster 3 redispatch: agent bids below MC in these specific hours
+                    # → grid operator pays REDISPATCH_PRICE for full capacity downward flexibility
+                    clearing = REDISPATCH_PRICE
+                    dispatch = AGENT_CAPACITY
+                elif ap <= fringe_price:
+                    clearing = ap            # agent sets the price (headroom discovery)
+                    dispatch = agent_needed  # partial dispatch if residual < AGENT_CAPACITY
                 else:
-                    # Agent bid above fringe: fringe steps in, agent not dispatched
+                    # Agent bid above fringe cap: fringe steps in, agent not dispatched
                     clearing = fringe_price
                     dispatch = 0.0
 
@@ -308,13 +321,19 @@ class DayAheadMarketEnv(gym.Env):
 
 def _classify_cluster(demand: np.ndarray, shutdown: np.ndarray) -> int:
     """
-    Cluster 2 takes priority if ANY hour has fringe offline.
-    Cluster 1 if any hour has demand in agent zone (BASELOAD < demand <= FRINGE_THRESHOLD).
-    Cluster 0 otherwise (agent always idle or always infra-marginal at fringe price).
+    Priority: Cluster 2 > Cluster 3 > Cluster 1 > Cluster 0.
+
+    Cluster 2: any hour has fringe offline (super-headroom).
+    Cluster 3: any of REDISPATCH_HOURS has demand in agent zone (opposing action required).
+    Cluster 1: any other hour has demand in agent zone (bid-high headroom).
+    Cluster 0: agent always idle or infra-marginal, no price-discovery hours.
     """
     if shutdown.any():
         return 2
     in_agent_zone = (demand > BASELOAD_CAPACITY) & (demand <= FRINGE_THRESHOLD)
+    redispatch_active = any(in_agent_zone[h] for h in REDISPATCH_HOURS)
+    if redispatch_active:
+        return 3
     if in_agent_zone.any():
         return 1
     return 0
