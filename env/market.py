@@ -89,12 +89,14 @@ class DayAheadMarketEnv(gym.Env):
         cluster_mixing_ratio: dict | None = None,
         noise_std_fraction: float = 0.05,
         seed: int | None = None,
+        include_cluster_indicator: bool = True,
     ):
         super().__init__()
-        self.demand_center_shift = demand_center_shift
-        self.force_cluster       = force_cluster
-        self.cluster_mixing_ratio = cluster_mixing_ratio
-        self.noise_std_fraction  = noise_std_fraction
+        self.demand_center_shift      = demand_center_shift
+        self.force_cluster            = force_cluster
+        self.cluster_mixing_ratio     = cluster_mixing_ratio
+        self.noise_std_fraction       = noise_std_fraction
+        self.include_cluster_indicator = include_cluster_indicator
 
         self._rng = np.random.default_rng(seed)
 
@@ -103,11 +105,12 @@ class DayAheadMarketEnv(gym.Env):
             low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32
         )
 
-        # Observation space: demand (normalised ≈ [0,2]) + one-hot cluster [0,1]
-        obs_low  = np.zeros(OBS_DIM, dtype=np.float32)
+        # Observation: 24h demand + optional cluster one-hot
+        obs_dim  = 24 + (N_CLUSTERS if include_cluster_indicator else 0)
+        obs_low  = np.zeros(obs_dim, dtype=np.float32)
         obs_high = np.concatenate([
-            np.full(24, 4.0, dtype=np.float32),   # demand up to 4× centre
-            np.ones(N_CLUSTERS, dtype=np.float32),
+            np.full(24, 4.0, dtype=np.float32),
+            *([ np.ones(N_CLUSTERS, dtype=np.float32) ] if include_cluster_indicator else []),
         ])
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
@@ -195,10 +198,11 @@ class DayAheadMarketEnv(gym.Env):
         # Last resort: return whatever we have
         return demand, _classify_cluster(demand, shutdown), shutdown
 
-    @staticmethod
-    def _make_obs(demand: np.ndarray, cluster: int) -> np.ndarray:
+    def _make_obs(self, demand: np.ndarray, cluster: int) -> np.ndarray:
         demand_norm = (demand / DEMAND_CENTER).astype(np.float32)
-        one_hot     = np.zeros(N_CLUSTERS, dtype=np.float32)
+        if not self.include_cluster_indicator:
+            return demand_norm
+        one_hot = np.zeros(N_CLUSTERS, dtype=np.float32)
         one_hot[cluster] = 1.0
         return np.concatenate([demand_norm, one_hot])
 
