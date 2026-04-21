@@ -219,11 +219,15 @@ class CumulativeTrainer:
             )
             summaries.append({"phase": i, "cluster": cluster, **summary})
 
-        # ── Final benchmark: same 10% rare-event mix as MVP2 ─────────────────
-        # This is the key comparison: cumulative-trained vs naive-trained agent
-        # on identical test conditions.
-        print("\n  Running final benchmark eval (10% rare-event mix = MVP2 conditions)...")
+        # ── Final benchmark: identical conditions to MVP2 ────────────────────
+        # MVP2 trains on {C0:70%, C1:10%, C2:10%, C3:10%}.
+        # We run two benchmark variants:
+        #   (a) Per-cluster binary mix (C0 90% + Cx 10%) — isolates each cluster
+        #   (b) Joint mix matching MVP2 exactly — the direct head-to-head metric
+        print("\n  Running final benchmark eval (matching MVP2 conditions)...")
         non_base_clusters = [p["cluster"] for p in self.phases if p["cluster"] != 0]
+
+        # (a) Per-cluster binary benchmark
         for tc in non_base_clusters:
             bench_mix = {0: 1.0 - self.benchmark_rare_frac, tc: self.benchmark_rare_frac}
             bench_kwargs = dict(self.base_env_kwargs)
@@ -233,6 +237,21 @@ class CumulativeTrainer:
             bench_result = evaluate(self.agent, bench_env, self.eval_episodes * 3)
             _log_eval(self.agent, bench_result, f"benchmark_10pct_vs_cluster{tc}")
             print(f"  Benchmark (C0 90% + C{tc} 10%): {_fmt_eval(bench_result)}")
+
+        # (b) Joint mix — matches MVP2's training distribution exactly
+        if len(non_base_clusters) > 0:
+            frac_each = self.benchmark_rare_frac
+            c0_frac   = max(0.0, 1.0 - frac_each * len(non_base_clusters))
+            joint_mix = {0: c0_frac}
+            for tc in non_base_clusters:
+                joint_mix[tc] = frac_each
+            bench_kwargs = dict(self.base_env_kwargs)
+            bench_kwargs["cluster_mixing_ratio"] = joint_mix
+            bench_kwargs.pop("force_cluster", None)
+            bench_env = DayAheadMarketEnv(**bench_kwargs)
+            bench_result = evaluate(self.agent, bench_env, self.eval_episodes * 3)
+            _log_eval(self.agent, bench_result, "benchmark_joint_mvp2_conditions")
+            print(f"  Benchmark joint {joint_mix}: {_fmt_eval(bench_result)}")
 
         print("\n" + "="*60)
         print("  Cumulative training complete.")
