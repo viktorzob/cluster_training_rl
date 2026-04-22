@@ -48,8 +48,10 @@ TOTAL_STEPS  = 900_000
 # C3 uses shift_map[3]=-20 → total=-40 → center=260 MW (redispatch conditions)
 DEMAND_SHIFT = -20.0
 
-# 10% each rare cluster — each rare cluster has same profit potential as in MVP3
-RARE_MIX = {0: 0.70, 1: 0.10, 2: 0.10, 3: 0.10}
+# Equal rarity: ~6.7% each of C1/C2/C3, 80% idle C0.
+# C1 and C3 have similar demand profiles (centers 260-280 MW) but require
+# OPPOSITE strategies in hours 13-15 → cluster indicator is the only signal.
+RARE_MIX = {0: 0.80, 1: 0.067, 2: 0.067, 3: 0.066}
 
 env = DayAheadMarketEnv(
     demand_center_shift  = DEMAND_SHIFT,

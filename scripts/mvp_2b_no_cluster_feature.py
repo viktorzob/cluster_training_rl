@@ -35,7 +35,7 @@ from train.trainer import train_phase
 
 TOTAL_STEPS  = 900_000
 DEMAND_SHIFT = -20.0
-RARE_MIX     = {0: 0.70, 1: 0.10, 2: 0.10, 3: 0.10}
+RARE_MIX     = {0: 0.80, 1: 0.067, 2: 0.067, 3: 0.066}
 OBS_DIM_NO_FEATURE = 24   # demand only, no cluster one-hot
 
 env = DayAheadMarketEnv(

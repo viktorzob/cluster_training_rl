@@ -1,3 +1,4 @@
+
 """
 MVP 3 — Cumulative cluster training.
 
@@ -44,17 +45,20 @@ phases = [
     {
         "cluster": 1,
         "steps":   STEPS_PER_PHASE,
-        "mixing":  None,                        # pure C1: dense headroom signal
-    },
-    {
-        "cluster": 2,
-        "steps":   STEPS_PER_PHASE,
-        "mixing":  {1: 0.2, 2: 0.8},           # 80% C2, 20% C1 (anti-forgetting)
+        "mixing":  None,                        # pure C1: bid HIGH in hours 13-15
     },
     {
         "cluster": 3,
         "steps":   STEPS_PER_PHASE,
-        "mixing":  {1: 0.2, 2: 0.2, 3: 0.6},  # 60% C3, 20% each previous
+        "mixing":  {1: 0.2, 3: 0.8},           # 80% C3, 20% C1 anti-forgetting
+        # KEY TRANSITION: C3 requires bid LOW in hours 13-15 — opposite of C1.
+        # Without cluster indicator the policy conflicts; with it the network routes
+        # C1-onehot→bid-high and C3-onehot→bid-low simultaneously.
+    },
+    {
+        "cluster": 2,
+        "steps":   STEPS_PER_PHASE,
+        "mixing":  {1: 0.1, 3: 0.1, 2: 0.8},  # 80% C2, maintain C1+C3 skills
     },
 ]
 
